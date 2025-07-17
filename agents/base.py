@@ -1,119 +1,135 @@
+# agents/base.py
 import asyncio
-import logging
-from abc import ABC, abstractmethod
-from datetime import datetime
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
 import json
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Optional, List
+from datetime import datetime
 
-@dataclass
+# Import our new utilities
+from utils.logging_config import get_logger
+from config.evaluation_config import EvaluationConfig
+
+# Add this class to maintain compatibility with existing agents
 class Message:
-    """Message structure for inter-agent communication"""
-    sender: str
-    receiver: str
-    content: Dict[str, Any]
-    message_type: str
-    timestamp: datetime
-    message_id: str
+    """Simple message class for compatibility"""
+    def __init__(self, sender: str, receiver: str, message_type: str, content: Dict[str, Any]):
+        self.sender = sender
+        self.receiver = receiver
+        self.message_type = message_type
+        self.content = content
+        self.timestamp = datetime.now()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'sender': self.sender,
+            'receiver': self.receiver,
+            'type': self.message_type,
+            'content': self.content,
+            'timestamp': self.timestamp.isoformat()
+        }
 
 class BaseAgent(ABC):
-    """Base class for all agents in the evaluation system"""
+    """Enhanced base agent with logging and configuration support"""
     
-    def __init__(self, name: str, model_config: Dict[str, Any]):
-        self.name = name
-        self.model_config = model_config
-        self.message_history: List[Message] = []
-        self.active = True
-        self.logger = logging.getLogger(f"Agent.{name}")
+    def __init__(self, agent_id: str, config: Optional[Dict[str, Any]] = None):
+        self.agent_id = agent_id
+        self.config = config or {}
         
+        # Set up logging
+        self.logger = get_logger(f"Agent.{agent_id}")
+        self.logger.info(f"Initializing agent: {agent_id}")
+        
+        # Agent state
+        self.is_initialized = False
+        self.message_count = 0
+        self.start_time = datetime.now()
+        
+        # Message history for learning
+        self.message_history = []
+        
+    async def initialize(self):
+        """Initialize the agent"""
+        self.logger.info(f"Agent {self.agent_id} initializing...")
+        await self._initialize_agent()
+        self.is_initialized = True
+        self.logger.info(f"Agent {self.agent_id} initialized successfully")
+    
     @abstractmethod
-    async def process_task(self, task: Dict[str, Any], context: Optional[Dict] = None) -> Dict[str, Any]:
-        """Process a task and return results"""
+    async def _initialize_agent(self):
+        """Agent-specific initialization logic"""
         pass
+    
+    @abstractmethod
+    async def process_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Process incoming message and return response"""
+        pass
+    
+    async def handle_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle message with logging and error handling"""
+        if not self.is_initialized:
+            await self.initialize()
         
-    async def receive_message(self, message: Message) -> None:
-        """Handle incoming messages from other agents"""
-        self.message_history.append(message)
-        self.logger.info(f"Received {message.message_type} from {message.sender}")
+        self.message_count += 1
+        message_id = message.get('id', f"msg_{self.message_count}")
         
-        # Route message based on type
-        if message.message_type == "task":
-            await self._handle_task_message(message)
-        elif message.message_type == "result":
-            await self._handle_result_message(message)
-        elif message.message_type == "query":
-            await self._handle_query_message(message)
-            
-    async def _handle_task_message(self, message: Message) -> None:
-        """Handle task assignment messages"""
+        self.logger.info(f"Processing message {message_id} of type: {message.get('type', 'unknown')}")
+        
         try:
-            result = await self.process_task(message.content)
-            await self._send_result(message.sender, result, message.message_id)
-        except Exception as e:
-            self.logger.error(f"Error processing task: {e}")
-            await self._send_error(message.sender, str(e), message.message_id)
+            # Store message in history
+            self.message_history.append({
+                'timestamp': datetime.now(),
+                'message_id': message_id,
+                'input': message,
+                'agent_id': self.agent_id
+            })
             
-    async def _handle_result_message(self, message: Message) -> None:
-        """Handle result messages from other agents"""
-        # Override in subclasses as needed
-        pass
-        
-    async def _handle_query_message(self, message: Message) -> None:
-        """Handle query messages from other agents"""
-        # Override in subclasses as needed
-        pass
-        
-    async def send_message(self, receiver: str, content: Dict[str, Any], 
-                          message_type: str) -> str:
-        """Send a message to another agent"""
-        message_id = f"{self.name}_{datetime.now().isoformat()}_{len(self.message_history)}"
-        message = Message(
-            sender=self.name,
-            receiver=receiver,
-            content=content,
-            message_type=message_type,
-            timestamp=datetime.now(),
-            message_id=message_id
-        )
-        
-        # In a real implementation, this would use a message queue
-        # For now, we'll use a simple callback system
-        await self._dispatch_message(message)
-        return message_id
-        
-    async def _dispatch_message(self, message: Message) -> None:
-        """Dispatch message to target agent (placeholder for message queue)"""
-        # This will be implemented in the coordinator
-        pass
-        
-    async def _send_result(self, receiver: str, result: Dict[str, Any], 
-                          original_message_id: str) -> None:
-        """Send a result message"""
-        content = {
-            "result": result,
-            "original_message_id": original_message_id
-        }
-        await self.send_message(receiver, content, "result")
-        
-    async def _send_error(self, receiver: str, error: str, 
-                         original_message_id: str) -> None:
-        """Send an error message"""
-        content = {
-            "error": error,
-            "original_message_id": original_message_id
-        }
-        await self.send_message(receiver, content, "error")
-        
-    def get_status(self) -> Dict[str, Any]:
-        """Get current agent status"""
+            # Process the message
+            response = await self.process_message(message)
+            
+            # Add metadata to response
+            response.update({
+                'agent_id': self.agent_id,
+                'message_id': message_id,
+                'timestamp': datetime.now().isoformat(),
+                'processing_time': (datetime.now() - self.start_time).total_seconds()
+            })
+            
+            # Store response in history
+            self.message_history[-1]['output'] = response
+            
+            self.logger.info(f"Successfully processed message {message_id}")
+            return response
+            
+        except Exception as e:
+            self.logger.error(f"Error processing message {message_id}: {str(e)}")
+            return {
+                'error': str(e),
+                'agent_id': self.agent_id,
+                'message_id': message_id,
+                'timestamp': datetime.now().isoformat()
+            }
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get agent statistics"""
+        uptime = (datetime.now() - self.start_time).total_seconds()
         return {
-            "name": self.name,
-            "active": self.active,
-            "messages_processed": len(self.message_history),
-            "last_activity": self.message_history[-1].timestamp if self.message_history else None
+            'agent_id': self.agent_id,
+            'is_initialized': self.is_initialized,
+            'message_count': self.message_count,
+            'uptime_seconds': uptime,
+            'messages_per_second': self.message_count / max(uptime, 1),
+            'last_activity': self.message_history[-1]['timestamp'] if self.message_history else None
         }
-        
-    def shutdown(self) -> None:
-        """Gracefully shutdown the agent"""
-        self.active = False
-        self.logger.info(f"Agent {self.name} shutting down")
+    
+    def get_recent_messages(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent message history"""
+        return self.message_history[-limit:]
+    
+    def clear_history(self):
+        """Clear message history (useful for long-running agents)"""
+        old_count = len(self.message_history)
+        self.message_history = []
+        self.logger.info(f"Cleared {old_count} messages from history")
+    
+    def __str__(self):
+        return f"Agent({self.agent_id}) - {self.message_count} messages processed"
